@@ -88,6 +88,8 @@ def _flash_attn_forward(
     return_softmax: bool
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    if attn_mask is not None:
+        attn_mask = maybe_contiguous(attn_mask)
     out, softmax_lse, S_dmask, rng_state = flash_attn_gpu.fwd(
         q,
         k,
@@ -158,6 +160,7 @@ def _flash_attn_varlen_forward(
     window_size_right: int = -1,
     softcap: float = 0.0,
     alibi_slopes: Optional[torch.Tensor] = None,
+    attn_mask: Optional[torch.Tensor] = None,
     return_softmax: bool = False,
     block_table: Optional[torch.Tensor] = None,
     leftpad_k: Optional[torch.Tensor] = None,
@@ -176,6 +179,7 @@ def _flash_attn_varlen_forward(
         leftpad_k,
         block_table,
         alibi_slopes,
+        attn_mask,
         max_seqlen_q,
         max_seqlen_k,
         dropout_p,
@@ -209,6 +213,7 @@ def _flash_attn_varlen_forward_fake(
     window_size_right: int = -1,
     softcap: float = 0.0,
     alibi_slopes: Optional[torch.Tensor] = None,
+    attn_mask: Optional[torch.Tensor] = None,
     return_softmax: bool = False,
     block_table: Optional[torch.Tensor] = None,
     leftpad_k: Optional[torch.Tensor] = None,
@@ -261,6 +266,8 @@ def _flash_attn_backward(
 ) -> torch.Tensor:
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
+    if attn_mask is not None:
+        attn_mask = maybe_contiguous(attn_mask)
     (
         dq,
         dk,
@@ -355,6 +362,7 @@ def _flash_attn_varlen_backward(
     window_size_right: int,
     softcap: float,
     alibi_slopes: Optional[torch.Tensor],
+    attn_mask: Optional[torch.Tensor],
     deterministic: bool,
     rng_state: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
@@ -379,6 +387,7 @@ def _flash_attn_varlen_backward(
         cu_seqlens_q,
         cu_seqlens_k,
         alibi_slopes,
+        attn_mask,
         max_seqlen_q,
         max_seqlen_k,
         dropout_p,
@@ -419,6 +428,7 @@ def _flash_attn_varlen_backward_fake(
     window_size_right: int,
     softcap: float,
     alibi_slopes: Optional[torch.Tensor],
+    attn_mask: Optional[torch.Tensor],
     deterministic: bool,
     rng_state: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
@@ -522,6 +532,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             ctx.window_size[1],
             ctx.softcap,
             ctx.alibi_slopes,
+            ctx.attn_mask,
             ctx.deterministic,
             rng_state=rng_state,
         )
@@ -947,6 +958,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             window_size_right=window_size[1],
             softcap=softcap,
             alibi_slopes=alibi_slopes,
+            attn_mask=attn_mask,
             return_softmax=return_softmax and dropout_p > 0,
             block_table=block_table,
         )
@@ -963,6 +975,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.softcap = softcap
             ctx.alibi_slopes = alibi_slopes
             ctx.deterministic = deterministic
+        ctx.attn_mask = attn_mask
 
         out = out_padded[..., :head_size_og]
         return out if not return_softmax else (out, softmax_lse, S_dmask)
@@ -1002,7 +1015,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         dq = dq[..., : dout.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : dout.shape[-1]]
         dv = dv[..., : dout.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 def flash_attn_qkvpacked_func(
@@ -1013,6 +1026,7 @@ def flash_attn_qkvpacked_func(
     window_size=(-1, -1),  # -1 means infinite context window
     softcap=0.0,  # <=0.0 means deactivate
     alibi_slopes=None,
+    attn_mask=None,
     deterministic=False,
     return_attn_probs=False,
 ):
@@ -1058,6 +1072,7 @@ def flash_attn_qkvpacked_func(
         window_size,
         softcap,
         alibi_slopes,
+        attn_mask,
         deterministic,
         return_attn_probs,
         torch.is_grad_enabled(),

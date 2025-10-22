@@ -451,6 +451,24 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
 
     const float alibi_slope = !Has_alibi || params.alibi_slopes_ptr == nullptr ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
     FLASH_NAMESPACE::Alibi<Is_causal> alibi(alibi_slope, binfo.actual_seqlen_k, binfo.actual_seqlen_q);
+    FLASH_NAMESPACE::Mask<Is_causal, Is_local, Has_alibi> mask(
+        binfo.actual_seqlen_k,
+        binfo.actual_seqlen_q,
+        params.window_size_left,
+        params.window_size_right,
+        alibi_slope,
+        params.attn_mask_ptr,
+        params.attn_mask_batch_stride,
+        params.attn_mask_head_stride,
+        params.attn_mask_row_stride,
+        params.attn_mask_col_stride,
+        params.attn_mask_elem_size,
+        params.attn_mask_seqlen_q,
+        params.attn_mask_seqlen_k,
+        params.attn_mask_is_additive,
+        params.attn_mask_is_bool,
+        bidb,
+        bidh);
 
     for (; m_block >= m_block_min; --m_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma_sdp, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_N, MMA_N)
@@ -528,6 +546,12 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
             }
 
         }
+
+        mask.apply_custom_mask_only(
+            scores,
+            n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
+            m_block * kBlockM + get<0>(taccScS_row(0)),
+            AtomLayoutMS * 16);
 
         // if (cute::thread(32, 0)) { print(scores); }
         // Compute the exponential value.
