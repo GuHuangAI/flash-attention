@@ -285,7 +285,24 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     FLASH_NAMESPACE::Softmax<2 * size<1>(acc_o)> softmax;
 
     const float alibi_slope = !Has_alibi || params.alibi_slopes_ptr == nullptr ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
-    FLASH_NAMESPACE::Mask<Is_causal, Is_local, Has_alibi> mask(binfo.actual_seqlen_k, binfo.actual_seqlen_q, params.window_size_left, params.window_size_right, alibi_slope);
+    FLASH_NAMESPACE::Mask<Is_causal, Is_local, Has_alibi> mask(
+        binfo.actual_seqlen_k,
+        binfo.actual_seqlen_q,
+        params.window_size_left,
+        params.window_size_right,
+        alibi_slope,
+        params.attn_mask_ptr,
+        params.attn_mask_batch_stride,
+        params.attn_mask_head_stride,
+        params.attn_mask_row_stride,
+        params.attn_mask_col_stride,
+        params.attn_mask_elem_size,
+        params.attn_mask_seqlen_q,
+        params.attn_mask_seqlen_k,
+        params.attn_mask_is_additive,
+        params.attn_mask_is_bool,
+        bidb,
+        bidh);
 
     // For performance reason, we separate out two kinds of iterations:
     // those that need masking on S, and those that don't.
@@ -836,7 +853,24 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     FLASH_NAMESPACE::Softmax<2 * size<1>(acc_o)> softmax;
 
     const float alibi_slope = !Has_alibi ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
-    FLASH_NAMESPACE::Mask<Is_causal, Is_local, Has_alibi> mask(binfo.actual_seqlen_k, binfo.actual_seqlen_q, params.window_size_left, params.window_size_right, alibi_slope);
+    FLASH_NAMESPACE::Mask<Is_causal, Is_local, Has_alibi> mask(
+        binfo.actual_seqlen_k,
+        binfo.actual_seqlen_q,
+        params.window_size_left,
+        params.window_size_right,
+        alibi_slope,
+        params.attn_mask_ptr,
+        params.attn_mask_batch_stride,
+        params.attn_mask_head_stride,
+        params.attn_mask_row_stride,
+        params.attn_mask_col_stride,
+        params.attn_mask_elem_size,
+        params.attn_mask_seqlen_q,
+        params.attn_mask_seqlen_k,
+        params.attn_mask_is_additive,
+        params.attn_mask_is_bool,
+        bidb,
+        bidh);
 
     // For performance reason, we separate out two kinds of iterations:
     // those that need masking on S, and those that don't.

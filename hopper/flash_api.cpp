@@ -8,6 +8,7 @@
 #include <c10/cuda/CUDAGuard.h>
 
 #include <cutlass/numeric_types.h>
+#include <cstdint>
 
 #include "flash.h"
 #include "static_switch.h"
@@ -74,7 +75,17 @@ void set_params_fprop(Flash_fwd_params &params,
                       int window_size_right,
                       int attention_chunk,
                       const float softcap=0.f,
-                      const int sm_margin=0) {
+                      const int sm_margin=0,
+                      void *attn_mask_ptr=nullptr,
+                      int64_t attn_mask_batch_stride=0,
+                      int64_t attn_mask_head_stride=0,
+                      int64_t attn_mask_row_stride=0,
+                      int64_t attn_mask_col_stride=0,
+                      int attn_mask_elem_size=0,
+                      int attn_mask_seqlen_q=0,
+                      int attn_mask_seqlen_k=0,
+                      bool attn_mask_is_additive=false,
+                      bool attn_mask_is_bool=false) {
 
     // Reset the parameters
     params = {};
@@ -165,6 +176,17 @@ void set_params_fprop(Flash_fwd_params &params,
     #ifdef FLASHATTENTION_DISABLE_LOCAL
         TORCH_CHECK(!params.is_local, "This flash attention build does not support local attention.");
     #endif
+
+    params.attn_mask_ptr = attn_mask_ptr;
+    params.attn_mask_batch_stride = attn_mask_ptr == nullptr ? 0 : attn_mask_batch_stride;
+    params.attn_mask_head_stride = attn_mask_ptr == nullptr ? 0 : attn_mask_head_stride;
+    params.attn_mask_row_stride = attn_mask_ptr == nullptr ? 0 : attn_mask_row_stride;
+    params.attn_mask_col_stride = attn_mask_ptr == nullptr ? 0 : attn_mask_col_stride;
+    params.attn_mask_elem_size = attn_mask_ptr == nullptr ? 0 : attn_mask_elem_size;
+    params.attn_mask_seqlen_q = attn_mask_ptr == nullptr ? 0 : attn_mask_seqlen_q;
+    params.attn_mask_seqlen_k = attn_mask_ptr == nullptr ? 0 : attn_mask_seqlen_k;
+    params.attn_mask_is_additive = attn_mask_ptr != nullptr && attn_mask_is_additive;
+    params.attn_mask_is_bool = attn_mask_ptr != nullptr && attn_mask_is_bool;
 }
 
 void set_params_dgrad(Flash_bwd_params &params,
@@ -203,7 +225,17 @@ void set_params_dgrad(Flash_bwd_params &params,
                       int attention_chunk,
                       const float softcap=0.f,
                       bool deterministic=false,
-                      int const sm_margin=0) {
+                      int const sm_margin=0,
+                      void *attn_mask_ptr=nullptr,
+                      int64_t attn_mask_batch_stride=0,
+                      int64_t attn_mask_head_stride=0,
+                      int64_t attn_mask_row_stride=0,
+                      int64_t attn_mask_col_stride=0,
+                      int attn_mask_elem_size=0,
+                      int attn_mask_seqlen_q=0,
+                      int attn_mask_seqlen_k=0,
+                      bool attn_mask_is_additive=false,
+                      bool attn_mask_is_bool=false) {
 
     set_params_fprop(params,
                      b, seqlen_q, seqlen_k, seqlen_q_rounded, seqlen_k_rounded, h, h_k, d, d_rounded,
@@ -219,7 +251,17 @@ void set_params_dgrad(Flash_bwd_params &params,
                      window_size_right,
                      attention_chunk,
                      softcap,
-                     sm_margin);
+                     sm_margin,
+                     attn_mask_ptr,
+                     attn_mask_batch_stride,
+                     attn_mask_head_stride,
+                     attn_mask_row_stride,
+                     attn_mask_col_stride,
+                     attn_mask_elem_size,
+                     attn_mask_seqlen_q,
+                     attn_mask_seqlen_k,
+                     attn_mask_is_additive,
+                     attn_mask_is_bool);
 
     // Set the pointers and strides.
     params.do_ptr = dout.data_ptr();

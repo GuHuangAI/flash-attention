@@ -134,7 +134,17 @@ void set_params_fprop(Flash_fwd_params &params,
                       int window_size_right,
                       int attention_chunk,
                       const float softcap=0.f,
-                      const int sm_margin=0) {
+                      const int sm_margin=0,
+                      void *attn_mask_ptr=nullptr,
+                      int64_t attn_mask_batch_stride=0,
+                      int64_t attn_mask_head_stride=0,
+                      int64_t attn_mask_row_stride=0,
+                      int64_t attn_mask_col_stride=0,
+                      int attn_mask_elem_size=0,
+                      int attn_mask_seqlen_q=0,
+                      int attn_mask_seqlen_k=0,
+                      bool attn_mask_is_additive=false,
+                      bool attn_mask_is_bool=false) {
 
     // Reset the parameters
     params = {};
@@ -226,6 +236,17 @@ void set_params_fprop(Flash_fwd_params &params,
     #ifdef FLASHATTENTION_DISABLE_LOCAL
         STD_TORCH_CHECK(!params.is_local, "This flash attention build does not support local attention.");
     #endif
+
+    params.attn_mask_ptr = attn_mask_ptr;
+    params.attn_mask_batch_stride = attn_mask_ptr == nullptr ? 0 : attn_mask_batch_stride;
+    params.attn_mask_head_stride = attn_mask_ptr == nullptr ? 0 : attn_mask_head_stride;
+    params.attn_mask_row_stride = attn_mask_ptr == nullptr ? 0 : attn_mask_row_stride;
+    params.attn_mask_col_stride = attn_mask_ptr == nullptr ? 0 : attn_mask_col_stride;
+    params.attn_mask_elem_size = attn_mask_ptr == nullptr ? 0 : attn_mask_elem_size;
+    params.attn_mask_seqlen_q = attn_mask_ptr == nullptr ? 0 : attn_mask_seqlen_q;
+    params.attn_mask_seqlen_k = attn_mask_ptr == nullptr ? 0 : attn_mask_seqlen_k;
+    params.attn_mask_is_additive = attn_mask_ptr != nullptr && attn_mask_is_additive;
+    params.attn_mask_is_bool = attn_mask_ptr != nullptr && attn_mask_is_bool;
 }
 
 void set_params_dgrad(Flash_bwd_params &params,
@@ -264,7 +285,17 @@ void set_params_dgrad(Flash_bwd_params &params,
                       int attention_chunk,
                       const float softcap=0.f,
                       bool deterministic=false,
-                      int const sm_margin=0) {
+                      int const sm_margin=0,
+                      void *attn_mask_ptr=nullptr,
+                      int64_t attn_mask_batch_stride=0,
+                      int64_t attn_mask_head_stride=0,
+                      int64_t attn_mask_row_stride=0,
+                      int64_t attn_mask_col_stride=0,
+                      int attn_mask_elem_size=0,
+                      int attn_mask_seqlen_q=0,
+                      int attn_mask_seqlen_k=0,
+                      bool attn_mask_is_additive=false,
+                      bool attn_mask_is_bool=false) {
 
     set_params_fprop(params,
                      b, seqlen_q, seqlen_k, seqlen_q_rounded, seqlen_k_rounded, h, h_k, d, d_rounded,
@@ -280,7 +311,17 @@ void set_params_dgrad(Flash_bwd_params &params,
                      window_size_right,
                      attention_chunk,
                      softcap,
-                     sm_margin);
+                     sm_margin,
+                     attn_mask_ptr,
+                     attn_mask_batch_stride,
+                     attn_mask_head_stride,
+                     attn_mask_row_stride,
+                     attn_mask_col_stride,
+                     attn_mask_elem_size,
+                     attn_mask_seqlen_q,
+                     attn_mask_seqlen_k,
+                     attn_mask_is_additive,
+                     attn_mask_is_bool);
 
     // Set the pointers and strides.
     params.do_ptr = dout.data_ptr();
@@ -764,6 +805,7 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
         int64_t attention_chunk,
         double softcap,
         bool is_rotary_interleaved,   // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
+        std::optional<Tensor> attn_mask_,
         std::optional<Tensor> scheduler_metadata_,  // (b + 1)
         int64_t num_splits,
         std::optional<bool> pack_gqa_,
@@ -798,6 +840,8 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
         STD_TORCH_CHECK(page_table.scalar_type() == torch::headeronly::ScalarType::Int, "page_table must have dtype torch.int32");
         STD_TORCH_CHECK(page_table.stride(-1) == 1, "page_table must have contiguous last dimension");
     }
+
+    STD_TORCH_CHECK(!attn_mask_.has_value() || !paged_KV, "Custom attention masks are not supported with paged KV cache.");
 
     Tensor cu_seqlens_q;
     bool const is_varlen_q = cu_seqlens_q_.has_value();
@@ -907,6 +951,12 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
         CHECK_SHAPE(leftpad_k, batch_size);
     }
 
+    if (attn_mask_.has_value()) {
+        STD_TORCH_CHECK(!leftpad_k_.has_value(), "Custom attention masks are not supported when leftpad_k is provided.");
+        STD_TORCH_CHECK(window_size_left < 0 && window_size_right < 0,
+                        "Custom attention masks are not supported with local windowed attention.");
+    }
+
     // This is what we will template on
     bool const is_varlen = is_varlen_q || is_varlen_k || seqused_q_.has_value() || seqused_k_.has_value() || leftpad_k_.has_value();
     #ifdef FLASHATTENTION_DISABLE_VARLEN
@@ -952,6 +1002,46 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
         softmax_lse = torch::stable::new_empty(q, {num_heads, total_q}, std::make_optional(torch::headeronly::ScalarType::Float));
     }
 
+    const int max_seqlen_q = seqlen_q;
+    const int max_seqlen_k = seqlen_k;
+    void *attn_mask_ptr = nullptr;
+    int64_t attn_mask_batch_stride = 0;
+    int64_t attn_mask_head_stride = 0;
+    int64_t attn_mask_row_stride = 0;
+    int64_t attn_mask_col_stride = 0;
+    int attn_mask_elem_size = 0;
+    int attn_mask_seqlen_q = 0;
+    int attn_mask_seqlen_k = 0;
+    bool attn_mask_is_additive = false;
+    bool attn_mask_is_bool = false;
+    Tensor attn_mask;
+    if (attn_mask_.has_value()) {
+        attn_mask = attn_mask_.value();
+        CHECK_DEVICE(attn_mask);
+        STD_TORCH_CHECK(attn_mask.dim() == 4, "attn_mask must have shape (batch, num_heads, seqlen_q, seqlen_k)");
+        STD_TORCH_CHECK(attn_mask.size(0) == batch_size, "attn_mask batch dimension must equal batch size");
+        STD_TORCH_CHECK(attn_mask.size(1) == num_heads, "attn_mask head dimension must equal number of query heads");
+        STD_TORCH_CHECK(attn_mask.size(2) == max_seqlen_q, "attn_mask seqlen_q dimension must equal max_seqlen_q");
+        STD_TORCH_CHECK(attn_mask.size(3) == max_seqlen_k, "attn_mask seqlen_k dimension must equal max_seqlen_k");
+        STD_TORCH_CHECK(attn_mask.stride(-1) == 1, "attn_mask must have contiguous last dimension");
+        if (attn_mask.scalar_type() == torch::headeronly::ScalarType::Bool) {
+            attn_mask_is_bool = true;
+        } else {
+            STD_TORCH_CHECK(attn_mask.scalar_type() == torch::headeronly::ScalarType::Float,
+                            "attn_mask must have dtype bool or float32");
+            attn_mask_is_additive = true;
+        }
+        attn_mask = attn_mask.contiguous();
+        attn_mask_ptr = attn_mask.data_ptr();
+        attn_mask_batch_stride = attn_mask.stride(0);
+        attn_mask_head_stride = attn_mask.stride(1);
+        attn_mask_row_stride = attn_mask.stride(2);
+        attn_mask_col_stride = attn_mask.stride(3);
+        attn_mask_elem_size = attn_mask.element_size();
+        attn_mask_seqlen_q = attn_mask.size(2);
+        attn_mask_seqlen_k = attn_mask.size(3);
+    }
+
     Flash_fwd_params params;
     set_params_fprop(params,
                      batch_size,
@@ -971,7 +1061,17 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
                      window_size_right,
                      attention_chunk,
                      softcap,
-                     sm_margin);
+                     sm_margin,
+                     attn_mask_ptr,
+                     attn_mask_batch_stride,
+                     attn_mask_head_stride,
+                     attn_mask_row_stride,
+                     attn_mask_col_stride,
+                     attn_mask_elem_size,
+                     attn_mask_seqlen_q,
+                     attn_mask_seqlen_k,
+                     attn_mask_is_additive,
+                     attn_mask_is_bool);
     params.total_q = total_q;
     params.total_k = total_k;
     params.b_k = batch_size_k;
@@ -1341,6 +1441,7 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor> mha_b
     std::optional<Tensor> cu_seqlens_k_,   // b+1
     std::optional<Tensor> seqused_q_, // b. If given, only this many elements of each batch element's queries and outputs are used.
     std::optional<Tensor> seqused_k_, // b. If given, only this many elements of each batch element's keys are used.
+    std::optional<Tensor> attn_mask_,
     std::optional<int64_t> max_seqlen_q_,
     std::optional<int64_t> max_seqlen_k_,
     std::optional<double> softmax_scale_,
@@ -1426,6 +1527,11 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor> mha_b
     // There's a case where is_causal=false, window_size=(-1, 0). Then set_params_bprop will set params.is_causal=true.
     // If we don't have is_causal here matching params.is_causal, we might get the wrong kBlockM (and cause IMA).
     is_causal = window_size_left < 0 && window_size_right == 0;
+
+    if (attn_mask_.has_value()) {
+        STD_TORCH_CHECK(window_size_left < 0 && window_size_right < 0,
+                        "Custom attention masks are not supported with local or causal attention.");
+    }
 
     int const arch = dprops->major * 10 + dprops->minor;
     int const head_size_rounded = round_up_headdim(std::max(head_size, head_size_v));
@@ -1565,6 +1671,46 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor> mha_b
         }
     }
 
+    const int max_seqlen_q = seqlen_q;
+    const int max_seqlen_k = seqlen_k;
+    void *attn_mask_ptr = nullptr;
+    int64_t attn_mask_batch_stride = 0;
+    int64_t attn_mask_head_stride = 0;
+    int64_t attn_mask_row_stride = 0;
+    int64_t attn_mask_col_stride = 0;
+    int attn_mask_elem_size = 0;
+    int attn_mask_seqlen_q = 0;
+    int attn_mask_seqlen_k = 0;
+    bool attn_mask_is_additive = false;
+    bool attn_mask_is_bool = false;
+    Tensor attn_mask;
+    if (attn_mask_.has_value()) {
+        attn_mask = attn_mask_.value();
+        CHECK_DEVICE(attn_mask);
+        STD_TORCH_CHECK(attn_mask.dim() == 4, "attn_mask must have shape (batch, num_heads, seqlen_q, seqlen_k)");
+        STD_TORCH_CHECK(attn_mask.size(0) == batch_size, "attn_mask batch dimension must equal batch size");
+        STD_TORCH_CHECK(attn_mask.size(1) == num_heads, "attn_mask head dimension must equal number of query heads");
+        STD_TORCH_CHECK(attn_mask.size(2) == max_seqlen_q, "attn_mask seqlen_q dimension must equal max_seqlen_q");
+        STD_TORCH_CHECK(attn_mask.size(3) == max_seqlen_k, "attn_mask seqlen_k dimension must equal max_seqlen_k");
+        STD_TORCH_CHECK(attn_mask.stride(-1) == 1, "attn_mask must have contiguous last dimension");
+        if (attn_mask.scalar_type() == torch::headeronly::ScalarType::Bool) {
+            attn_mask_is_bool = true;
+        } else {
+            STD_TORCH_CHECK(attn_mask.scalar_type() == torch::headeronly::ScalarType::Float,
+                            "attn_mask must have dtype bool or float32");
+            attn_mask_is_additive = true;
+        }
+        attn_mask = attn_mask.contiguous();
+        attn_mask_ptr = attn_mask.data_ptr();
+        attn_mask_batch_stride = attn_mask.stride(0);
+        attn_mask_head_stride = attn_mask.stride(1);
+        attn_mask_row_stride = attn_mask.stride(2);
+        attn_mask_col_stride = attn_mask.stride(3);
+        attn_mask_elem_size = attn_mask.element_size();
+        attn_mask_seqlen_q = attn_mask.size(2);
+        attn_mask_seqlen_k = attn_mask.size(3);
+    }
+
     Flash_bwd_params params;
     set_params_dgrad(params,
                      batch_size,
@@ -1590,7 +1736,17 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor> mha_b
                      0,  // attention_chunk
                      softcap,
                      deterministic,
-                     sm_margin);
+                     sm_margin,
+                     attn_mask_ptr,
+                     attn_mask_batch_stride,
+                     attn_mask_head_stride,
+                     attn_mask_row_stride,
+                     attn_mask_col_stride,
+                     attn_mask_elem_size,
+                     attn_mask_seqlen_q,
+                     attn_mask_seqlen_k,
+                     attn_mask_is_additive,
+                     attn_mask_is_bool);
     params.total_q = total_q;
     params.total_k = total_k;
     params.softmax_lse_log2_ptr = softmax_lse_log2.data_ptr();
@@ -1774,12 +1930,13 @@ void boxed_mha_fwd(
     auto attention_chunk = to<int64_t>(stack[27]);
     auto softcap = to<double>(stack[28]);
     auto is_rotary_interleaved = to<bool>(stack[29]);
-    auto scheduler_metadata = to<std::optional<Tensor>>(stack[30]);
-    auto num_splits = to<int64_t>(stack[31]);
-    auto pack_gqa = to<std::optional<bool>>(stack[32]);
-    auto sm_margin = to<int64_t>(stack[33]);
+    auto attn_mask = to<std::optional<Tensor>>(stack[30]);
+    auto scheduler_metadata = to<std::optional<Tensor>>(stack[31]);
+    auto num_splits = to<int64_t>(stack[32]);
+    auto pack_gqa = to<std::optional<bool>>(stack[33]);
+    auto sm_margin = to<int64_t>(stack[34]);
 
-    auto [out_, softmax_lse, out_accum, softmax_lse_accum] = mha_fwd(q, k, v, k_new, v_new, q_v, out, cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new, seqused_q, seqused_k, max_seqlen_q, max_seqlen_k, page_table, kv_batch_idx, leftpad_k, rotary_cos, rotary_sin, seqlens_rotary, q_descale, k_descale, v_descale, softmax_scale, is_causal, window_size_left, window_size_right, attention_chunk, softcap, is_rotary_interleaved, scheduler_metadata, num_splits, pack_gqa, sm_margin);
+    auto [out_, softmax_lse, out_accum, softmax_lse_accum] = mha_fwd(q, k, v, k_new, v_new, q_v, out, cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new, seqused_q, seqused_k, max_seqlen_q, max_seqlen_k, page_table, kv_batch_idx, leftpad_k, rotary_cos, rotary_sin, seqlens_rotary, q_descale, k_descale, v_descale, softmax_scale, is_causal, window_size_left, window_size_right, attention_chunk, softcap, is_rotary_interleaved, attn_mask, scheduler_metadata, num_splits, pack_gqa, sm_margin);
 
 
     stack[0] = from(out_);
@@ -1806,17 +1963,18 @@ void boxed_mha_bwd(
     auto cu_seqlens_k = to<std::optional<Tensor>>(stack[10]);
     auto seqused_q = to<std::optional<Tensor>>(stack[11]);
     auto seqused_k = to<std::optional<Tensor>>(stack[12]);
-    auto max_seqlen_q = to<std::optional<int64_t>>(stack[13]);
-    auto max_seqlen_k = to<std::optional<int64_t>>(stack[14]);
-    auto softmax_scale = to<std::optional<double>>(stack[15]);
-    auto is_causal = to<bool>(stack[16]);
-    auto window_size_left = to<int64_t>(stack[17]);
-    auto window_size_right = to<int64_t>(stack[18]);
-    auto softcap = to<double>(stack[19]);
-    auto deterministic = to<bool>(stack[20]);
-    auto sm_margin = to<int64_t>(stack[21]);
+    auto attn_mask = to<std::optional<Tensor>>(stack[13]);
+    auto max_seqlen_q = to<std::optional<int64_t>>(stack[14]);
+    auto max_seqlen_k = to<std::optional<int64_t>>(stack[15]);
+    auto softmax_scale = to<std::optional<double>>(stack[16]);
+    auto is_causal = to<bool>(stack[17]);
+    auto window_size_left = to<int64_t>(stack[18]);
+    auto window_size_right = to<int64_t>(stack[19]);
+    auto softcap = to<double>(stack[20]);
+    auto deterministic = to<bool>(stack[21]);
+    auto sm_margin = to<int64_t>(stack[22]);
 
-    auto [dq_, dk_, dv_, softmax_d, softmax_lse_log2, dq_accum, dk_accum, dv_accum] = mha_bwd(dout, q, k, v, out, softmax_lse, dq, dk, dv, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, max_seqlen_q, max_seqlen_k, softmax_scale, is_causal, window_size_left, window_size_right, softcap, deterministic, sm_margin);
+    auto [dq_, dk_, dv_, softmax_d, softmax_lse_log2, dq_accum, dk_accum, dv_accum] = mha_bwd(dout, q, k, v, out, softmax_lse, dq, dk, dv, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, attn_mask, max_seqlen_q, max_seqlen_k, softmax_scale, is_causal, window_size_left, window_size_right, softcap, deterministic, sm_margin);
 
     stack[0] = from(dq_);
     stack[1] = from(dk_);
@@ -1911,6 +2069,7 @@ STABLE_TORCH_LIBRARY(flash_attn_3, m) {
         "int attention_chunk = 0,"
         "float softcap = 0.0,"
         "bool is_rotary_interleaved = False,"
+        "Tensor? attn_mask = None,"
         "Tensor? scheduler_metadata = None,"
         "int num_splits = 0,"
         "bool? pack_gqa = None,"
@@ -1929,6 +2088,7 @@ STABLE_TORCH_LIBRARY(flash_attn_3, m) {
         "Tensor? cu_seqlens_k = None,"
         "Tensor? seqused_q = None,"
         "Tensor? seqused_k = None,"
+        "Tensor? attn_mask = None,"
         "int? max_seqlen_q = None,"
         "int? max_seqlen_k = None,"
         "float? softmax_scale = None,"
