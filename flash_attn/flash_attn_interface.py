@@ -88,6 +88,8 @@ def _flash_attn_forward(
     return_softmax: bool
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    if attn_mask is not None:
+        attn_mask = maybe_contiguous(attn_mask)
     out, softmax_lse, S_dmask, rng_state = flash_attn_gpu.fwd(
         q,
         k,
