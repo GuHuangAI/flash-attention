@@ -6,6 +6,7 @@
 #include "namespace_config.h"
 
 #include <cute/tensor.hpp>
+#include <algorithm>
 #include <cstdint>
 
 namespace FLASH_NAMESPACE {
