@@ -165,6 +165,17 @@ struct Flash_fwd_params : public Qkv_params {
 
     int arch;
     int num_sm;
+
+    void * __restrict__ attn_mask_ptr;
+    index_t attn_mask_batch_stride;
+    index_t attn_mask_head_stride;
+    index_t attn_mask_row_stride;
+    index_t attn_mask_col_stride;
+    int attn_mask_elem_size;
+    int attn_mask_seqlen_q;
+    int attn_mask_seqlen_k;
+    bool attn_mask_is_additive;
+    bool attn_mask_is_bool;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

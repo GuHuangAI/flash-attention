@@ -11,6 +11,7 @@
 #include "philox_unpack.cuh"  // For at::cuda::philox::unpack
 
 #include <cutlass/numeric_types.h>
+#include <cstdint>
 
 #include "namespace_config.h"
 #include "hardware_info.h"
@@ -50,7 +51,17 @@ void set_params_fprop(Flash_fwd_params &params,
                       int window_size_right,
                       const float softcap,
                       bool seqlenq_ngroups_swapped=false,
-                      const bool unpadded_lse=false) {
+                      const bool unpadded_lse=false,
+                      void *attn_mask_ptr=nullptr,
+                      int64_t attn_mask_batch_stride=0,
+                      int64_t attn_mask_head_stride=0,
+                      int64_t attn_mask_row_stride=0,
+                      int64_t attn_mask_col_stride=0,
+                      int attn_mask_elem_size=0,
+                      int attn_mask_seqlen_q=0,
+                      int attn_mask_seqlen_k=0,
+                      bool attn_mask_is_additive=false,
+                      bool attn_mask_is_bool=false) {
 
     // Reset the parameters
     params = {};
@@ -156,6 +167,16 @@ void set_params_fprop(Flash_fwd_params &params,
 
     params.unpadded_lse = unpadded_lse;
     params.seqlenq_ngroups_swapped = seqlenq_ngroups_swapped;
+    params.attn_mask_ptr = attn_mask_ptr;
+    params.attn_mask_batch_stride = attn_mask_ptr == nullptr ? 0 : attn_mask_batch_stride;
+    params.attn_mask_head_stride = attn_mask_ptr == nullptr ? 0 : attn_mask_head_stride;
+    params.attn_mask_row_stride = attn_mask_ptr == nullptr ? 0 : attn_mask_row_stride;
+    params.attn_mask_col_stride = attn_mask_ptr == nullptr ? 0 : attn_mask_col_stride;
+    params.attn_mask_elem_size = attn_mask_ptr == nullptr ? 0 : attn_mask_elem_size;
+    params.attn_mask_seqlen_q = attn_mask_ptr == nullptr ? 0 : attn_mask_seqlen_q;
+    params.attn_mask_seqlen_k = attn_mask_ptr == nullptr ? 0 : attn_mask_seqlen_k;
+    params.attn_mask_is_additive = attn_mask_ptr != nullptr && attn_mask_is_additive;
+    params.attn_mask_is_bool = attn_mask_ptr != nullptr && attn_mask_is_bool;
 }
 
 void set_params_dgrad(Flash_bwd_params &params,
@@ -191,7 +212,17 @@ void set_params_dgrad(Flash_bwd_params &params,
                       int window_size_right,
                       const float softcap,
                       bool deterministic,
-                      const bool unpadded_lse) {
+                      const bool unpadded_lse,
+                      void *attn_mask_ptr=nullptr,
+                      int64_t attn_mask_batch_stride=0,
+                      int64_t attn_mask_head_stride=0,
+                      int64_t attn_mask_row_stride=0,
+                      int64_t attn_mask_col_stride=0,
+                      int attn_mask_elem_size=0,
+                      int attn_mask_seqlen_q=0,
+                      int attn_mask_seqlen_k=0,
+                      bool attn_mask_is_additive=false,
+                      bool attn_mask_is_bool=false) {
 
     set_params_fprop(params,
                      b, seqlen_q, seqlen_k, seqlen_q_rounded, seqlen_k_rounded, h, h_k, d, d_rounded,
@@ -207,7 +238,17 @@ void set_params_dgrad(Flash_bwd_params &params,
                      window_size_right,
                      softcap,
                      false, // seqlenq_ngroups_swapped
-                     unpadded_lse);
+                     unpadded_lse,
+                     attn_mask_ptr,
+                     attn_mask_batch_stride,
+                     attn_mask_head_stride,
+                     attn_mask_row_stride,
+                     attn_mask_col_stride,
+                     attn_mask_elem_size,
+                     attn_mask_seqlen_q,
+                     attn_mask_seqlen_k,
+                     attn_mask_is_additive,
+                     attn_mask_is_bool);
 
     // Set the pointers and strides.
     params.do_ptr = dout.data_ptr();
@@ -522,6 +563,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                std::optional<const at::Tensor> &leftpad_k_, // batch_size
                std::optional<at::Tensor> &block_table_, // batch_size x max_num_blocks_per_seq
                std::optional<at::Tensor> &alibi_slopes_, // num_heads or b x num_heads
+               std::optional<at::Tensor> &attn_mask_,
                int max_seqlen_q,
                const int max_seqlen_k,
                const float p_dropout,
@@ -561,6 +603,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         TORCH_CHECK(block_table.dtype() == torch::kInt32, "block_table must have dtype torch.int32");
         TORCH_CHECK(block_table.stride(-1) == 1, "block_table must have contiguous last dimension");
     }
+
+    TORCH_CHECK(!attn_mask_.has_value() || !paged_KV, "Custom attention masks are not supported with paged KV cache.");
 
     TORCH_CHECK(q.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(k.stride(-1) == 1, "Input tensor must have contiguous last dimension");
@@ -666,7 +710,50 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         if (return_softmax) {p.zero_();}
     }
 
+    if (attn_mask_.has_value()) {
+        TORCH_CHECK(!leftpad_k_.has_value(), "Custom attention masks are not supported when leftpad_k is provided.");
+        TORCH_CHECK(window_size_left < 0 && window_size_right < 0, "Custom attention masks are not supported with local windowed attention.");
+    }
+
     Flash_fwd_params params;
+    void *attn_mask_ptr = nullptr;
+    int64_t attn_mask_batch_stride = 0;
+    int64_t attn_mask_head_stride = 0;
+    int64_t attn_mask_row_stride = 0;
+    int64_t attn_mask_col_stride = 0;
+    int attn_mask_elem_size = 0;
+    int attn_mask_seqlen_q = 0;
+    int attn_mask_seqlen_k = 0;
+    bool attn_mask_is_additive = false;
+    bool attn_mask_is_bool = false;
+    at::Tensor attn_mask;
+    if (attn_mask_.has_value()) {
+        TORCH_CHECK(!seqlenq_ngroups_swapped, "Custom attention masks are not supported when seqlenq_ngroups_swapped is active.");
+        attn_mask = attn_mask_.value();
+        CHECK_DEVICE(attn_mask);
+        TORCH_CHECK(attn_mask.dim() == 4, "attn_mask must have shape (batch, num_heads, seqlen_q, seqlen_k)");
+        TORCH_CHECK(attn_mask.size(0) == batch_size, "attn_mask batch dimension must equal batch size");
+        TORCH_CHECK(attn_mask.size(1) == num_heads, "attn_mask head dimension must equal number of query heads");
+        TORCH_CHECK(attn_mask.size(2) == max_seqlen_q, "attn_mask seqlen_q dimension must equal max_seqlen_q");
+        TORCH_CHECK(attn_mask.size(3) == max_seqlen_k, "attn_mask seqlen_k dimension must equal max_seqlen_k");
+        TORCH_CHECK(attn_mask.stride(-1) == 1, "attn_mask must have contiguous last dimension");
+        if (attn_mask.scalar_type() == torch::kBool) {
+            attn_mask_is_bool = true;
+        } else {
+            TORCH_CHECK(attn_mask.scalar_type() == torch::kFloat32, "attn_mask must have dtype bool or float32");
+            attn_mask_is_additive = true;
+        }
+        attn_mask = attn_mask.contiguous();
+        attn_mask_ptr = attn_mask.data_ptr();
+        attn_mask_batch_stride = attn_mask.stride(0);
+        attn_mask_head_stride = attn_mask.stride(1);
+        attn_mask_row_stride = attn_mask.stride(2);
+        attn_mask_col_stride = attn_mask.stride(3);
+        attn_mask_elem_size = attn_mask.element_size();
+        attn_mask_seqlen_q = attn_mask.size(2);
+        attn_mask_seqlen_k = attn_mask.size(3);
+    }
+
     set_params_fprop(params,
                      batch_size,
                      max_seqlen_q, max_seqlen_k,
@@ -685,7 +772,17 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                      window_size_right,
                      softcap,
                      seqlenq_ngroups_swapped,
-                     /*unpadded_lse*/true);
+                     /*unpadded_lse*/true,
+                     attn_mask_ptr,
+                     attn_mask_batch_stride,
+                     attn_mask_head_stride,
+                     attn_mask_row_stride,
+                     attn_mask_col_stride,
+                     attn_mask_elem_size,
+                     attn_mask_seqlen_q,
+                     attn_mask_seqlen_k,
+                     attn_mask_is_additive,
+                     attn_mask_is_bool);
     params.total_q = total_q;
 
     if (paged_KV) {
@@ -983,6 +1080,7 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                const at::Tensor &cu_seqlens_q,  // b+1
                const at::Tensor &cu_seqlens_k,  // b+1
                std::optional<at::Tensor> &alibi_slopes_, // num_heads or b x num_heads
+               std::optional<at::Tensor> &attn_mask_,
                const int max_seqlen_q,
                const int max_seqlen_k,          // max sequence length to choose the kernel
                const float p_dropout,         // probability to drop
@@ -1133,6 +1231,43 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
         softmax_d.zero_();
     }
 
+    void *attn_mask_ptr = nullptr;
+    int64_t attn_mask_batch_stride = 0;
+    int64_t attn_mask_head_stride = 0;
+    int64_t attn_mask_row_stride = 0;
+    int64_t attn_mask_col_stride = 0;
+    int attn_mask_elem_size = 0;
+    int attn_mask_seqlen_q = 0;
+    int attn_mask_seqlen_k = 0;
+    bool attn_mask_is_additive = false;
+    bool attn_mask_is_bool = false;
+    at::Tensor attn_mask;
+    if (attn_mask_.has_value()) {
+        attn_mask = attn_mask_.value();
+        CHECK_DEVICE(attn_mask);
+        TORCH_CHECK(attn_mask.dim() == 4, "attn_mask must have shape (batch, num_heads, seqlen_q, seqlen_k)");
+        TORCH_CHECK(attn_mask.size(0) == batch_size, "attn_mask batch dimension must equal batch size");
+        TORCH_CHECK(attn_mask.size(1) == num_heads, "attn_mask head dimension must equal number of query heads");
+        TORCH_CHECK(attn_mask.size(2) == max_seqlen_q, "attn_mask seqlen_q dimension must equal max_seqlen_q");
+        TORCH_CHECK(attn_mask.size(3) == max_seqlen_k, "attn_mask seqlen_k dimension must equal max_seqlen_k");
+        TORCH_CHECK(attn_mask.stride(-1) == 1, "attn_mask must have contiguous last dimension");
+        if (attn_mask.scalar_type() == torch::kBool) {
+            attn_mask_is_bool = true;
+        } else {
+            TORCH_CHECK(attn_mask.scalar_type() == torch::kFloat32, "attn_mask must have dtype bool or float32");
+            attn_mask_is_additive = true;
+        }
+        attn_mask = attn_mask.contiguous();
+        attn_mask_ptr = attn_mask.data_ptr();
+        attn_mask_batch_stride = attn_mask.stride(0);
+        attn_mask_head_stride = attn_mask.stride(1);
+        attn_mask_row_stride = attn_mask.stride(2);
+        attn_mask_col_stride = attn_mask.stride(3);
+        attn_mask_elem_size = attn_mask.element_size();
+        attn_mask_seqlen_q = attn_mask.size(2);
+        attn_mask_seqlen_k = attn_mask.size(3);
+    }
+
     Flash_bwd_params params;
 
     set_params_dgrad(params,
@@ -1156,7 +1291,17 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                      window_size_right,
                      softcap,
                      deterministic,
-                     /*unpadded_lse*/true);
+                     /*unpadded_lse*/true,
+                     attn_mask_ptr,
+                     attn_mask_batch_stride,
+                     attn_mask_head_stride,
+                     attn_mask_row_stride,
+                     attn_mask_col_stride,
+                     attn_mask_elem_size,
+                     attn_mask_seqlen_q,
+                     attn_mask_seqlen_k,
+                     attn_mask_is_additive,
+                     attn_mask_is_bool);
     params.dq_accum_split_stride = !deterministic ? 0 : dq_accum.stride(0);
     params.total_q = total_q;
 
